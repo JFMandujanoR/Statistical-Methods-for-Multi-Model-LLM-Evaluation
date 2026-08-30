@@ -17,4 +17,4 @@ Statistical methods for comparing more than two language models on a shared eval
 > Predictions from [TIGER-AI-Lab/MMLU-Pro](https://github.com/TIGER-AI-Lab/MMLU-Pro) (`eval_results/`), Apache License 2.0.
 
 ## Citation
-
+Mandujano Reyes, Juan Francisco. "Statistical Methods for Multiple Language Model Comparison on a Shared Evaluation." arXiv preprint arXiv:2608.22659 (2026).
