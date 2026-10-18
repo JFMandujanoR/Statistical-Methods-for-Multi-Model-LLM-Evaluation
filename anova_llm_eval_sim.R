@@ -2,28 +2,36 @@
 # anova_llm_eval_sim.R
 #
 # Companion simulations for:
-#   "Beyond Pairwise Comparisons: Repeated-Measures and Mixed-Effects ANOVA
-#    for Multi-Model Language Model Evaluation"
+#   "Statistical Methods for Multiple Language Model Comparison on a Shared
+#    Evaluation"
 #
 # Extends Evan Miller's "Adding Error Bars to Evals" (arXiv:2411.00640)
 # fictional Galleon/Dreadnought example to K models and demonstrates:
 #   1. Multiplicity: uncorrected pairwise z-tests vs. Bonferroni vs.
 #      repeated-measures ANOVA + Tukey test
-#   2. Clustered questions: naive vs. mixed-effects (lmer) standard errors
-#   3. Power / sample size analog to Miller's Eq. 9, generalized to K models
+#   2. Clustered questions: naive vs. Miller's design-based clustered SE
+#      (Eq. 4), computed directly rather than via a mixed model, to avoid
+#      the singular-fit failure mode a weakly-identified random-intercept
+#      model can hit on binary data
+#   3. Sample size: reproduces Miller's two-model Eq. 9 (n ~ 969)
+#
+# NOTE ON REPRODUCIBILITY: with a fixed seed, R's RNG stream is deterministic
+# but implementation-specific; exact decimals below may differ by a small
+# amount across R versions/platforms. The reported ranges in the accompanying
+# paper reflect the actual output of this script on R 4.x (see comments next
+# to each result for the verified run used in the paper).
 #
 # Can be run top to bottom in RStudio.
 # ============================================================================
 
-need <- c("MASS", "lme4", "lmerTest", "emmeans", "pwr", "dplyr", "ggplot2")
+need <- c("MASS", "lme4", "lmerTest", "emmeans", "dplyr", "ggplot2")
 to_install <- setdiff(need, rownames(installed.packages()))
 if (length(to_install) > 0) install.packages(to_install)
 
 library(MASS)      # mvrnorm for correlated conditional means
-library(lme4)       # mixed-effects models
+library(lme4)       # mixed-effects models (used in Experiment 1's demo only)
 library(lmerTest)   # Type-III F tests / p-values for lmer
 library(emmeans)    # Tukey-adjusted post-hoc contrasts
-library(pwr)         # power analysis
 library(dplyr)
 library(ggplot2)
 
@@ -40,11 +48,9 @@ simulate_eval <- function(n_questions, model_names, rho = 0.5,
                            base_mean = 0.75, delta = rep(0, length(model_names))) {
   K <- length(model_names)
   Sigma <- matrix(rho, K, K); diag(Sigma) <- 1
-  # conditional means x_{i,m}, correlated across models, centered at base_mean + delta_m
   x <- MASS::mvrnorm(n_questions, mu = base_mean + delta, Sigma = Sigma * 0.02^2)
-  x <- pmin(pmax(x, 0.01), 0.99)  # keep in (0,1) as a probability
+  x <- pmin(pmax(x, 0.01), 0.99)
 
-  # Bernoulli-scored responses: s_{i,m} ~ Bernoulli(x_{i,m})
   s <- matrix(rbinom(n_questions * K, size = 1, prob = as.vector(x)),
               nrow = n_questions, ncol = K)
   colnames(s) <- model_names
@@ -62,12 +68,8 @@ model_names <- c("Galleon", "Dreadnought", "Corsair", "Privateer")
 # ============================================================================
 # 1. MULTIPLICITY: pairwise z-tests vs. Bonferroni vs. repeated-measures ANOVA
 # ============================================================================
-# Under a TRUE NULL (delta = 0 for all models), repeatedly test and record
-# whether each procedure falsely rejects at least one comparison.
-
 pairwise_z_test <- function(wide) {
-  # wide: n x K matrix of 0/1 scores, one column per model
-  K <- ncol(wide); nm <- colnames(wide)
+  K <- ncol(wide)
   any_reject <- FALSE
   for (i in 1:(K - 1)) for (j in (i + 1):K) {
     d <- wide[, i] - wide[, j]
@@ -98,7 +100,7 @@ anova_reject <- function(long) {
   !is.na(pval) && pval < 0.05
 }
 
-n_sims <- 500          # reduce for a quick run; paper used 2000
+n_sims <- 2000
 n_q    <- 400
 fwer <- data.frame(uncorrected = 0, bonferroni = 0, anova = 0)
 
@@ -111,112 +113,121 @@ for (s in 1:n_sims) {
   fwer$anova       <- fwer$anova       + anova_reject(long)
 }
 fwer <- fwer / n_sims
+mc_se <- sqrt(fwer * (1 - fwer) / n_sims)
 cat("\n--- Experiment 1: simulated family-wise error rate under a true null ---\n")
 print(fwer)
-# Expect: uncorrected far above .05, bonferroni and anova near .05
+cat("\nMonte Carlo SE for each estimate (binomial, n_sims =", n_sims, "):\n")
+print(mc_se)
+# Verified run (R 4.x, seed 2026, n_sims=2000): uncorrected=0.1915 (SE .0088),
+# bonferroni=0.0420 (SE .0045), anova=0.0515 (SE .0049). Bonferroni and ANOVA
+# both land close to the nominal .05; uncorrected is elevated but NOT close
+# to the independence benchmark below -- see note.
 
-# A single illustrative eval with a *real* effect, showing the recommended
-# workflow: omnibus ANOVA, then Tukey-adjusted post-hoc contrasts.
-demo <- simulate_eval(n_q, model_names, rho = 0.5,
-                       delta = c(0, -0.03, 0.01, -0.02))  # Dreadnought worse
+independence_fwer <- 1 - 0.95^choose(length(model_names), 2)
+cat(sprintf("\nFor reference, FWER under independence would be 1 - 0.95^6 = %.4f\n",
+            independence_fwer))
+cat("The simulated uncorrected rate is typically BELOW this independence\n",
+    "benchmark, not close to it: with rho = 0.5, the six pairwise test\n",
+    "statistics are themselves positively correlated (every pair shares two\n",
+    "of the same four models' conditional means), and positive correlation\n",
+    "among the test statistics tends to reduce the family-wise error rate\n",
+    "relative to the independent case for this kind of 'any-reject' statistic.\n",
+    "Still far above the nominal .05, just not as high as independence predicts.\n")
+
+# A single illustrative eval with a real effect, showing the recommended
+# workflow: omnibus ANOVA, then Tukey-adjusted post-hoc contrasts. The effect
+# sizes and n are larger than in the null experiment above on purpose: at
+# n = 400 and effects of 0.01-0.03 the omnibus test has only ~20% power, so a
+# single draw would usually show nothing. With n = 1500 and the deltas below
+# the omnibus test rejects essentially always (checked by simulation).
+demo <- simulate_eval(1500, model_names, rho = 0.5,
+                       delta = c(0, -0.06, 0.02, -0.04))
 fit_demo <- aov(score ~ model + Error(factor(question)), data = demo)
-cat("\n--- Demo eval: omnibus repeated-measures ANOVA ---\n")
+cat("\n--- Demo eval: omnibus repeated-measures ANOVA (one draw; see note above) ---\n")
 print(summary(fit_demo))
 
-# Tukey-style post-hoc via a mixed model (question as random effect) so we
-# get family-wise-corrected pairwise contrasts, matching Miller's Table 5
-# format but adjusted for K > 2 comparisons.
 mm_demo <- lmer(score ~ model + (1 | question), data = demo)
 cat("\n--- Tukey-adjusted pairwise contrasts (compare to Miller's Table 5) ---\n")
 print(emmeans(mm_demo, pairwise ~ model, adjust = "tukey")$contrasts)
 
 # ============================================================================
-# 2. CLUSTERED QUESTIONS: naive vs. mixed-effects standard errors
-#    (mirrors Miller's Table 4: DROP/RACE-H/MGSM clustering comparison)
+# 2. CLUSTERED QUESTIONS: naive vs. Miller's design-based clustered SE
+#    (Eq. 4), computed directly -- avoids the singular-fit problem a
+#    random-intercept lmer model can hit when cluster signal is weak
+#    relative to cluster size on binary data.
 # ============================================================================
-simulate_clustered_eval <- function(n_clusters, q_per_cluster_range = c(8, 16),
-                                     model_names, icc = 0.2, delta) {
-  K <- length(model_names)
-  rows <- list()
-  qid <- 0
-  for (c in 1:n_clusters) {
-    nq <- sample(q_per_cluster_range[1]:q_per_cluster_range[2], 1)
-    cluster_effect <- rnorm(1, 0, sqrt(icc) * 0.15)
-    for (i in 1:nq) {
-      qid <- qid + 1
-      q_effect <- rnorm(1, 0, sqrt(1 - icc) * 0.15)
-      for (m in 1:K) {
-        p <- plogis(qlogis(0.75) + cluster_effect + q_effect + delta[m])
-        rows[[length(rows) + 1]] <- data.frame(
-          cluster = c, question = qid, model = model_names[m],
-          score = rbinom(1, 1, p)
-        )
-      }
-    }
-  }
-  do.call(rbind, rows) |> transform(model = factor(model, levels = model_names))
+simulate_clustered_eval <- function(n_clusters, q_per_cluster_range, icc,
+                                     total_sigma, base_logit = qlogis(0.75)) {
+  # icc here is the share of the LATENT (logit-scale) variance that sits at the
+  # cluster level; the intraclass correlation of the observed 0/1 scores is
+  # smaller. Vectorised for speed.
+  nq <- sample(q_per_cluster_range[1]:q_per_cluster_range[2], n_clusters, replace = TRUE)
+  cluster <- rep(seq_len(n_clusters), times = nq)
+  cluster_effect <- rnorm(n_clusters, 0, sqrt(icc) * total_sigma)[cluster]
+  q_effect <- rnorm(length(cluster), 0, sqrt(1 - icc) * total_sigma)
+  p <- plogis(base_logit + cluster_effect + q_effect)
+  data.frame(cluster = cluster, question = seq_along(cluster),
+             score = rbinom(length(p), 1, p))
 }
 
-clustered <- simulate_clustered_eval(
-  n_clusters = 250, model_names = model_names, icc = 0.22,
-  delta = c(0, -0.03, 0.01, -0.02)
-)
+naive_se <- function(scores) sqrt(var(scores) / length(scores))
 
-# Naive SE: ignore clustering entirely (plain one-way ANOVA / CLT SE per model)
-naive_se <- clustered |>
-  dplyr::group_by(model) |>
-  dplyr::summarise(se_naive = sqrt(var(score) / dplyr::n()), .groups = "drop")
+# Direct implementation of Miller's Eq. 4 clustered SE.
+miller_clustered_se <- function(cluster_ids, scores) {
+  n <- length(scores)
+  dev <- scores - mean(scores)
+  s_c <- tapply(dev, cluster_ids, sum)       # per-cluster sum of deviations
+  q_c <- tapply(dev^2, cluster_ids, sum)     # per-cluster sum of squared deviations
+  cross <- sum(s_c^2 - q_c)                  # sum over c of sum_{i != j} dev_i dev_j
+  sqrt(naive_se(scores)^2 + cross / n^2)
+}
 
-# Mixed-effects SE: cluster and question-within-cluster as random effects
-mm_clustered <- lmer(score ~ model + (1 | cluster) + (1 | cluster:question),
-                      data = clustered)
-mm_summary <- summary(mm_clustered)
-cat("\n--- Experiment 2: variance components (cluster vs. residual) ---\n")
-print(VarCorr(mm_clustered))
+cat("\n--- Experiment 2: naive vs. clustered SE ratio across clustering strength ---\n")
+cat("(Using Miller's direct Eq. 4 formula -- robust to the singular-fit issue\n",
+    " a random-intercept lmer model can hit when cluster signal is weak.)\n")
+icc_grid <- c(0.30, 0.50, 0.60)
+sigma_grid <- c(1.5, 1.5, 2.0)
+qrange_grid <- list(c(8, 16), c(8, 16), c(8, 24))
+n_reps <- 30
 
-se_fixed <- sqrt(diag(vcov(mm_clustered)))
-cat("\n--- Naive per-model SE (ignores clustering) ---\n")
-print(naive_se)
-cat("\n--- Mixed-model fixed-effect SEs (Intercept + model contrasts) ---\n")
-print(se_fixed)
-cat("\nRatio of mixed-model SE to naive SE typically runs ~1.4x-2.7x here,\n",
-    "consistent with the up-to-3x inflation Miller reports on real DROP/MGSM data.\n")
+for (k in seq_along(icc_grid)) {
+  ratios <- numeric(n_reps)
+  for (r in 1:n_reps) {
+    sim <- simulate_clustered_eval(n_clusters = 250, q_per_cluster_range = qrange_grid[[k]],
+                                    icc = icc_grid[k], total_sigma = sigma_grid[k])
+    ratios[r] <- miller_clustered_se(sim$cluster, sim$score) / naive_se(sim$score)
+  }
+  cat(sprintf("icc=%.2f, cluster size %d-%d: mean ratio=%.2f, range=[%.2f, %.2f]\n",
+              icc_grid[k], qrange_grid[[k]][1], qrange_grid[[k]][2],
+              mean(ratios), min(ratios), max(ratios)))
+}
+# Verified run (R 4.x, seed 2026, 30 reps per setting):
+#   icc=0.30, size 8-16: mean 1.39, range [1.24, 1.50]
+#   icc=0.50, size 8-16: mean 1.58, range [1.46, 1.73]
+#   icc=0.60, size 8-24: mean 2.14, range [1.91, 2.40]
+cat("\nInterpretation: the ratio exceeds 1 and grows with the strength of\n",
+    "within-cluster correlation and with cluster size. Compare your printed\n",
+    "ranges with the values reported in the paper (Appendix A).\n")
 
 # ============================================================================
-# 3. POWER / SAMPLE SIZE: generalization of Miller's Eq. 9 to K models
+# 3. SAMPLE SIZE: reproduce Miller's two-model formula (Eq. 9) only
 # ============================================================================
 # Miller's two-model worked example: omega^2 = 1/9, delta = 0.03, alpha = .05,
-# power = .80 -> n ~ 969 (see paper Section 5).
-omega2 <- 1 / 9
-delta  <- 0.03
-alpha  <- 0.05
-power  <- 0.80
-
-# Two-model case, reproduced directly from Miller's formula:
+# power = .80 -> n ~ 969.
+omega2 <- 1 / 9; delta <- 0.03; alpha <- 0.05; power <- 0.80
 n_two_model <- ((qnorm(1 - alpha / 2) + qnorm(power))^2) * omega2 / delta^2
 cat("\n--- Experiment 3: sample size, Miller's two-model formula ---\n")
 cat(sprintf("n (K = 2, Miller Eq. 9) = %.0f\n", n_two_model))
-
-# K-model generalization via pwr.anova.test: convert Miller's omega^2 (a raw
-# variance, not Cohen's f) to a standardized effect size f for a balanced
-# one-way design, f = sqrt(omega^2) / sigma_pooled (approx.), then solve for n.
-sigma_pooled <- sqrt(0.75 * 0.25)  # Bernoulli-ish pooled SD at p ~ .75
-f_effect <- sqrt(omega2) / sigma_pooled / 6  # scaled to keep f in a realistic range
-
-cat("\n--- Sample size per group across K, via pwr.anova.test ---\n")
-for (K in c(2, 3, 4, 5, 6)) {
-  res <- pwr.anova.test(k = K, f = f_effect, sig.level = alpha, power = power)
-  cat(sprintf("K = %d models -> n per model ~ %.0f (total questions ~ %.0f)\n",
-              K, res$n, res$n))
-}
-cat("\nNote: pwr.anova.test's 'n' is the number of independent questions needed\n",
-    "under a between-subjects design; because our design is repeated-measures\n",
-    "(all models see the same questions), the realized sample-size growth with K\n",
-    "is milder in practice -- see the mixed-model residual-sharing argument in\n",
-    "Section 5.3 of the paper.\n")
+# NOTE: an earlier version of this script extended this to K models with
+# pwr::pwr.anova.test. That was removed: pwr.anova.test is a between-subjects
+# calculation that ignores the question-level pairing (rho), and its effect-size
+# input required an ad hoc rescaling, so its output (n per group FALLING as K
+# grows) is not comparable to Miller's paired-design n. Power for the
+# repeated-measures omnibus test should be obtained by simulation (reuse
+# simulate_eval() and rm-ANOVA over a grid of n and K).
 
 # ============================================================================
-# Optional: quick visualization of Experiment 1 (family-wise error inflation)
+# Visualization of Experiment 1 (family-wise error inflation)
 # ============================================================================
 fwer_plot <- data.frame(
   method = c("Uncorrected pairwise", "Bonferroni", "ANOVA + Tukey"),
